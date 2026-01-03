@@ -1,8 +1,8 @@
 import AVFoundation
-import SwiftUI
 import Combine
 import Opus
 import SoundAnalysis
+import SwiftUI
 
 class AudioStreamManager: NSObject, ObservableObject {
     private let engine = AVAudioEngine()
@@ -12,7 +12,10 @@ class AudioStreamManager: NSObject, ObservableObject {
 
     // --- VAD & BUFFERING PROPERTIES ---
     private var preRollBuffers: [AVAudioPCMBuffer] = []
-    private let maxPreRollCount = 50 // Exactly 1 second if buffer is 20ms
+    private let maxPreRollCount = 50  // Exactly 1 second if buffer is 20ms
+
+    // NEW: Segment tracking
+    private var currentSegmentId: UInt8 = 0
 
     // We use a lock to ensure the Audio Thread and VAD Thread don't collide
     private let stateLock = NSLock()
@@ -58,7 +61,8 @@ class AudioStreamManager: NSObject, ObservableObject {
                 if detected {
                     self.hangoverWorkItem?.cancel()
                     if !self.isTransmitting {
-                        // Rising Edge: Send the "Time Machine" buffers first
+                        // Rising Edge: Start new segment
+                        self.currentSegmentId = (self.currentSegmentId &+ 1)
                         self.flushPreRoll()
                         self.isTransmitting = true
                     }
@@ -79,7 +83,8 @@ class AudioStreamManager: NSObject, ObservableObject {
             engine.connect(player, to: engine.mainMixerNode, format: hardwareFormat)
 
             inputNode.removeTap(onBus: 0)
-            inputNode.installTap(onBus: 0, bufferSize: 960, format: hardwareFormat) { [weak self] (buffer, time) in
+            inputNode.installTap(onBus: 0, bufferSize: 960, format: hardwareFormat) {
+                [weak self] (buffer, time) in
                 guard let self = self, self.isActive else { return }
 
                 // 1. Analyze for speech detection
@@ -88,7 +93,6 @@ class AudioStreamManager: NSObject, ObservableObject {
                 // 2. Thread-safe data handling
                 self.stateLock.lock()
                 if self.isTransmitting {
-                    // Send real-time
                     self.processAndSend(buffer: buffer)
                 } else {
                     // Not transmitting? Fill the pre-roll "rolling window"
@@ -117,7 +121,7 @@ class AudioStreamManager: NSObject, ObservableObject {
 
     private func flushPreRoll() {
         // Since we are inside the lock when this is called, order is guaranteed
-        print("VAD: Flushing \(preRollBuffers.count) frames.")
+        print("VAD: Flushing \(preRollBuffers.count) frames with segmentId=\(currentSegmentId)")
         for buffer in preRollBuffers {
             self.processAndSend(buffer: buffer)
         }
@@ -129,8 +133,12 @@ class AudioStreamManager: NSObject, ObservableObject {
         let workItem = DispatchWorkItem { [weak self] in
             guard let self = self else { return }
             self.stateLock.lock()
-            print("VAD: 1.0s silence reached. Stopping transmission.")
+
+            print(
+                "VAD: 1.0s silence reached. Stopping transmission for segmentId=\(self.currentSegmentId)"
+            )
             self.isTransmitting = false
+
             self.stateLock.unlock()
         }
         hangoverWorkItem = workItem
@@ -146,9 +154,12 @@ class AudioStreamManager: NSObject, ObservableObject {
             guard let self = self else { return }
             do {
                 var data = Data(count: 1500)
-                if let encodedCount = try self.encoder?.encode(buffer, to: &data), encodedCount > 0 {
+                if let encodedCount = try self.encoder?.encode(buffer, to: &data), encodedCount > 0
+                {
                     let opusData = data.prefix(encodedCount)
-                    let encryptedData = try secManager.encryptPayload(Data(opusData))
+                    // Pass the current segmentId
+                    let encryptedData = try secManager.encryptPayload(
+                        Data(opusData), segmentId: self.currentSegmentId)
                     NotificationCenter.default.post(name: .sendUDP, object: encryptedData)
                 }
             } catch {
@@ -160,10 +171,14 @@ class AudioStreamManager: NSObject, ObservableObject {
     // MARK: - Standard Helpers
 
     private func setupObservers() {
-        receivedObserver = NotificationCenter.default.addObserver(forName: .receivedUDP, object: nil, queue: .main) { [weak self] notification in
+        receivedObserver = NotificationCenter.default.addObserver(
+            forName: .receivedUDP, object: nil, queue: .main
+        ) { [weak self] notification in
             if let data = notification.object as? Data { self?.handleIncomingAudio(data: data) }
         }
-        endCallObserver = NotificationCenter.default.addObserver(forName: NSNotification.Name("EndAudioInternal"), object: nil, queue: .main) { [weak self] _ in
+        endCallObserver = NotificationCenter.default.addObserver(
+            forName: NSNotification.Name("EndAudioInternal"), object: nil, queue: .main
+        ) { [weak self] _ in
             self?.endCall()
         }
     }
@@ -196,6 +211,7 @@ class AudioStreamManager: NSObject, ObservableObject {
         isSpeaking = false
         preRollBuffers.removeAll()
         hangoverWorkItem?.cancel()
+        currentSegmentId = 0
         stateLock.unlock()
 
         // 4. Cleanup observers and session
@@ -214,7 +230,8 @@ class AudioStreamManager: NSObject, ObservableObject {
             endCallObserver = nil
         }
 
-        try? AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])
+        try? AVAudioSession.sharedInstance().setActive(
+            false, options: [.notifyOthersOnDeactivation])
         encoder = nil
         decoder = nil
 
@@ -234,10 +251,11 @@ class AudioStreamManager: NSObject, ObservableObject {
 // MARK: - Deep Copy Helper
 extension AVAudioPCMBuffer {
     func deepCopy() -> AVAudioPCMBuffer? {
-        guard let copy = AVAudioPCMBuffer(pcmFormat: self.format, frameCapacity: self.frameCapacity) else { return nil }
+        guard let copy = AVAudioPCMBuffer(pcmFormat: self.format, frameCapacity: self.frameCapacity)
+        else { return nil }
         copy.frameLength = self.frameLength
 
-        let size = Int(self.frameLength) * MemoryLayout<Float>.size // Assuming standard float format
+        let size = Int(self.frameLength) * MemoryLayout<Float>.size  // Assuming standard float format
         if let src = self.floatChannelData, let dst = copy.floatChannelData {
             for i in 0..<Int(self.format.channelCount) {
                 memcpy(dst[i], src[i], size)
@@ -253,7 +271,8 @@ class SpeechResultObserver: NSObject, SNResultsObserving {
 
     func request(_ request: SNRequest, didProduce result: SNResult) {
         guard let result = result as? SNClassificationResult,
-              let speech = result.classification(forIdentifier: "speech") else { return }
+            let speech = result.classification(forIdentifier: "speech")
+        else { return }
         let detected = speech.confidence > 0.7
         if detected != isSpeaking {
             isSpeaking = detected
