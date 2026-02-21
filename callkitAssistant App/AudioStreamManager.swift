@@ -28,11 +28,14 @@ class AudioStreamManager: NSObject, ObservableObject {
     private var isActive = false
     private var audioSetupComplete = false
 
+    // ✅ Performance Tracking
+    private var pipelineStartTime: CFAbsoluteTime = 0
+
     @Published var isSpeaking: Bool = false
     private var format: AVAudioFormat?
     var securityManager: SecurityManager?
 
-    // ✅ CallKit Callback: Fires after engine is fully running (Post-VPIO)
+    // ✅ CallKit Callback
     var onEngineStarted: (() -> Void)?
 
     override init() {
@@ -41,14 +44,15 @@ class AudioStreamManager: NSObject, ObservableObject {
     }
 
     // ─────────────────────────────────────────────────────────────────────
-    // 🖥️ SIMULATOR PATH (Direct Control)
+    // 🖥️ SIMULATOR PATH
     // ─────────────────────────────────────────────────────────────────────
     #if targetEnvironment(simulator)
     func startAudio() {
         guard !isActive else { return }
-        logTime("🎤 startAudio — beginning setup (Simulator)")
+        pipelineStartTime = CFAbsoluteTimeGetCurrent()
+        logTime("🎤 startAudio — beginning setup (Simulator)", start: pipelineStartTime)
+        
         let session = AVAudioSession.sharedInstance()
-
         do {
             try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetoothHFP])
             try session.setActive(true)
@@ -93,64 +97,60 @@ class AudioStreamManager: NSObject, ObservableObject {
             player.play()
             isActive = true
             hasEnded = false
-            isTransmitting = true // Force transmit on simulator
+            isTransmitting = true
 
-            logTime("✅ Audio Engine Started & Running (Simulator)")
+            logTime("✅ Audio Engine Started & Running (Simulator)", start: pipelineStartTime)
 
         } catch {
-            logTime("❌ startAudio failed: \(error)")
+            logTime("❌ startAudio failed: \(error)", start: pipelineStartTime)
             isActive = false
         }
     }
     #endif
 
     // ─────────────────────────────────────────────────────────────────────
-    // 📱 DEVICE PATH (CallKit Lifecycle)
+    // 📱 DEVICE PATH
     // ─────────────────────────────────────────────────────────────────────
     #if !targetEnvironment(simulator)
     
-    // Phase 1: Called BEFORE startCall() — slow DSP init, NO format queries
+    // Phase 1: Called at APP LAUNCH — slow DSP init
     func prepareAudioHardware() {
-        logTime("🔧 prepareAudioHardware — Phase 1 (Pre-CallKit)")
+        let prepStart = CFAbsoluteTimeGetCurrent()
+        logTime("🔧 prepareAudioHardware — Phase 1 (Pre-CallKit)", start: prepStart)
         do {
-            // Set category but DO NOT activate — CallKit will do that
             try AVAudioSession.sharedInstance().setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetoothHFP])
             engine.attach(player)
 
-            // Pre-warm ML model and Opus with a dummy format
             let warmupFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48000, channels: 1, interleaved: false)!
             
-            // Warmup analyzer
             let warmupAnalyzer = SNAudioStreamAnalyzer(format: warmupFormat)
             let warmupRequest = try SNClassifySoundRequest(classifierIdentifier: .version1)
             try warmupAnalyzer.add(warmupRequest, withObserver: SpeechResultObserver())
 
-            // Warmup Opus
             self.encoder = try Opus.Encoder(format: warmupFormat, application: .voip)
             self.decoder = try Opus.Decoder(format: warmupFormat)
 
-            logTime("✅ Audio hardware prepared (ML models warmed)")
+            logTime("✅ Audio hardware prepared (ML models warmed)", start: prepStart)
         } catch {
-            logTime("❌ prepareAudioHardware failed: \(error)")
+            logTime("❌ prepareAudioHardware failed: \(error)", start: prepStart)
         }
     }
 
-    // Phase 2: Called AFTER didActivate — format is now valid
-    func setupAudioAfterActivation() {
-        logTime("🔧 setupAudioAfterActivation — Phase 2 (Post-CallKit)")
+    // Phase 2: Called AFTER didActivate
+    func setupAudioAfterActivation(pipelineStartTime: CFAbsoluteTime) {
+        self.pipelineStartTime = pipelineStartTime
+        logTime("🔧 setupAudioAfterActivation — Phase 2 (Post-CallKit)", start: pipelineStartTime)
         let inputNode = engine.inputNode
 
         do {
             let hardwareFormat = inputNode.inputFormat(forBus: 0)
-            logTime("🔧 hardwareFormat: \(hardwareFormat)")
+            logTime("🔧 hardwareFormat: \(hardwareFormat)", start: pipelineStartTime)
 
             engine.connect(player, to: engine.mainMixerNode, format: hardwareFormat)
 
-            // Enable VPIO — triggers async reconfiguration
             try inputNode.setVoiceProcessingEnabled(true)
-            logTime("🔧 setVoiceProcessingEnabled called")
+            logTime("🔧 setVoiceProcessingEnabled called", start: pipelineStartTime)
 
-            // Listen for configuration change (VPIO reconfig)
             NotificationCenter.default.addObserver(
                 forName: .AVAudioEngineConfigurationChange,
                 object: engine,
@@ -160,17 +160,16 @@ class AudioStreamManager: NSObject, ObservableObject {
                 NotificationCenter.default.removeObserver(
                     self, name: .AVAudioEngineConfigurationChange, object: self.engine
                 )
-                logTime("✅ AVAudioEngineConfigurationChange received")
+                logTime("✅ AVAudioEngineConfigurationChange received", start: self.pipelineStartTime)
                 self.engine.stop()
                 self.finishAudioSetup()
             }
 
             try engine.start()
-            logTime("🔧 engine.start() returned — isRunning: \(engine.isRunning)")
+            logTime("🔧 engine.start() returned — isRunning: \(engine.isRunning)", start: pipelineStartTime)
 
             if engine.isRunning {
-                // VPIO applied synchronously (rare but possible)
-                logTime("🔧 Engine running after VPIO — stopping for finishAudioSetup")
+                logTime("🔧 Engine running after VPIO — stopping for finishAudioSetup", start: pipelineStartTime)
                 NotificationCenter.default.removeObserver(
                     self, name: .AVAudioEngineConfigurationChange, object: engine
                 )
@@ -179,16 +178,15 @@ class AudioStreamManager: NSObject, ObservableObject {
             }
 
         } catch {
-            logTime("❌ setupAudioAfterActivation failed: \(error)")
+            logTime("❌ setupAudioAfterActivation failed: \(error)", start: pipelineStartTime)
         }
     }
 
-    // Phase 3: Final setup after VPIO reconfiguration
     private func finishAudioSetup() {
         stateLock.lock()
         guard !audioSetupComplete else {
             stateLock.unlock()
-            logTime("⚠️ finishAudioSetup called twice — ignoring")
+            logTime("⚠️ finishAudioSetup called twice — ignoring", start: pipelineStartTime)
             return
         }
         audioSetupComplete = true
@@ -198,10 +196,9 @@ class AudioStreamManager: NSObject, ObservableObject {
 
         do {
             let hardwareFormat = inputNode.inputFormat(forBus: 0)
-            logTime("✅ Hardware format post-VPIO: \(hardwareFormat)")
+            logTime("✅ Hardware format post-VPIO: \(hardwareFormat)", start: pipelineStartTime)
             self.format = hardwareFormat
 
-            // Re-init encoder/decoder with confirmed format
             self.encoder = try Opus.Encoder(format: hardwareFormat, application: .voip)
             self.decoder = try Opus.Decoder(format: hardwareFormat)
 
@@ -239,27 +236,26 @@ class AudioStreamManager: NSObject, ObservableObject {
             isActive = true
             hasEnded = false
             
-            logTime("🎤 Engine restarted post-VPIO, isRunning: \(engine.isRunning)")
+            logTime("🎤 Engine restarted post-VPIO, isRunning: \(engine.isRunning)", start: pipelineStartTime)
             
-            // ✅ Fire callback for handshake/UDP
             onEngineStarted?()
 
         } catch {
-            logTime("❌ finishAudioSetup failed: \(error)")
+            logTime("❌ finishAudioSetup failed: \(error)", start: pipelineStartTime)
         }
     }
     #endif
 
     // ─────────────────────────────────────────────────────────────────────
-    // COMMON: Teardown & Helpers (Both Paths)
+    // COMMON: Teardown & Helpers
     // ─────────────────────────────────────────────────────────────────────
     
     func endCall() {
-        guard !hasEnded else {  // ✅ Add this guard at the VERY top
-            logTime("⚠️ endCall called but hasEnded is true — ignoring")
+        guard !hasEnded else {
+            logTime("⚠️ endCall called but hasEnded is true — ignoring", start: pipelineStartTime)
             return
         }
-        logTime("🛑 endCall called")
+        logTime("🛑 endCall called", start: pipelineStartTime)
 
         hasEnded = true
         isActive = false
@@ -293,7 +289,7 @@ class AudioStreamManager: NSObject, ObservableObject {
         encoder = nil
         decoder = nil
 
-        logTime("✅ Call ended successfully.")
+        logTime("✅ Call ended successfully.", start: pipelineStartTime)
     }
 
     func handleIncomingAudio(data: Data) {
@@ -302,7 +298,7 @@ class AudioStreamManager: NSObject, ObservableObject {
             let decodedBuffer = try decoder.decode(data)
             if !player.isPlaying { player.play() }
             player.scheduleBuffer(decodedBuffer, completionHandler: nil)
-        } catch { logTime("Decoding error: \(error)") }
+        } catch { logTime("Decoding error: \(error)", start: pipelineStartTime) }
     }
 
     private func setupObservers() {
@@ -319,7 +315,7 @@ class AudioStreamManager: NSObject, ObservableObject {
     }
 
     private func flushPreRoll() {
-        logTime("VAD: Flushing \(preRollBuffers.count) frames")
+        logTime("VAD: Flushing \(preRollBuffers.count) frames", start: pipelineStartTime)
         for buffer in preRollBuffers { self.processAndSend(buffer: buffer) }
         preRollBuffers.removeAll()
     }
@@ -329,7 +325,7 @@ class AudioStreamManager: NSObject, ObservableObject {
         let workItem = DispatchWorkItem { [weak self] in
             guard let self = self else { return }
             self.stateLock.lock()
-            logTime("VAD: silence threshold reached. Stopping transmission")
+            logTime("VAD: silence threshold reached. Stopping transmission", start: self.pipelineStartTime)
             self.isTransmitting = false
             self.stateLock.unlock()
         }
@@ -339,11 +335,11 @@ class AudioStreamManager: NSObject, ObservableObject {
 
     private func processAndSend(buffer: AVAudioPCMBuffer) {
         guard let secManager = self.securityManager else {
-            logTime("🔴 processAndSend: securityManager is nil")
+            logTime("🔴 processAndSend: securityManager is nil", start: pipelineStartTime)
             return
         }
         guard secManager.sessionKey != nil else {
-            logTime("🔴 processAndSend: sessionKey is nil — handshake incomplete?")
+            logTime("🔴 processAndSend: sessionKey is nil — handshake incomplete?", start: pipelineStartTime)
             return
         }
         
@@ -352,14 +348,14 @@ class AudioStreamManager: NSObject, ObservableObject {
             do {
                 var data = Data(count: 1500)
                 guard let encodedCount = try self.encoder?.encode(buffer, to: &data), encodedCount > 0 else {
-                    logTime("🔴 Encode returned 0 or nil")
+                    logTime("🔴 Encode returned 0 or nil", start: self.pipelineStartTime)
                     return
                 }
                 let opusData = data.prefix(encodedCount)
                 let encryptedData = try secManager.encryptPayload(Data(opusData))
                 NotificationCenter.default.post(name: .sendUDP, object: encryptedData)
             } catch {
-                logTime("🔴 processAndSend error: \(error)")
+                logTime("🔴 processAndSend error: \(error)", start: self.pipelineStartTime)
             }
         }
     }

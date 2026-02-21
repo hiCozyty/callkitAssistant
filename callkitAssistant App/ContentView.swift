@@ -3,9 +3,8 @@ import SwiftUI
 import os
 import Combine
 
-// ✅ Ensure logTime is accessible globally (move to Utils.swift if preferred)
 func logTime(_ message: String, start: CFAbsoluteTime? = nil) {
-    let elapsed = start != nil ? String(format: "%.0fms", (CFAbsoluteTimeGetCurrent() - start!) * 1000) : ""
+    let elapsed = start != nil ? String(format: "T+%dms", Int((CFAbsoluteTimeGetCurrent() - start!) * 1000)) : ""
     let timestamp = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
     print("[\(timestamp)] \(message) \(elapsed)")
 }
@@ -32,8 +31,8 @@ struct ContentView: View {
     @State private var enrollError: String? = nil
     @State private var serverReachable: Bool? = nil
 
-    // ✅ Declare cancellables
     @State private var cancellables = Set<AnyCancellable>()
+    @State private var pipelineStartTime: CFAbsoluteTime = 0
 
     #if targetEnvironment(simulator)
     let isRunningOnSimulator = true
@@ -75,19 +74,12 @@ struct ContentView: View {
 
                 Button(action: {
                     if isRunningOnSimulator {
-                        if !isCalling {
-                            startThePipeline()
-                        } else {
-                            stopThePipeline()
-                        }
+                        if !isCalling { startThePipeline() } else { stopThePipeline() }
                     } else {
-                        if !isCalling {
-                            startThePipeline()
-                        }
+                        if !isCalling { startThePipeline() }
                     }
                 }) {
-                    Text(buttonText)
-                        .bold().padding()
+                    Text(buttonText).bold().padding()
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(buttonColor)
@@ -101,23 +93,19 @@ struct ContentView: View {
 
             } else if !isEnrolled && serverReachable == true {
                 Text("Not enrolled. Connect to your home network first.")
-                    .multilineTextAlignment(.center)
-                    .padding(.horizontal)
+                    .multilineTextAlignment(.center).padding(.horizontal)
 
                 Button(action: { enrollDevice() }) {
-                    Text(isEnrolling ? "Enrolling…" : "Enroll Device")
-                        .bold().padding()
+                    Text(isEnrolling ? "Enrolling…" : "Enroll Device").bold().padding()
                 }
-                .buttonStyle(.borderedProminent)
-                .disabled(isEnrolling)
+                .buttonStyle(.borderedProminent).disabled(isEnrolling)
 
                 if let err = enrollError {
                     Text(err).foregroundColor(.red).font(.footnote)
                 }
             } else if serverReachable == false {
                 Text("Server unreachable. Start your server.")
-                    .multilineTextAlignment(.center)
-                    .padding(.horizontal)
+                    .multilineTextAlignment(.center).padding(.horizontal)
                 Button("Retry") {
                     Task { await checkServerReachability() }
                 }
@@ -133,8 +121,14 @@ struct ContentView: View {
 
             Task { await checkServerReachability() }
             
-            // ✅ Device-only: Wire CallKit state to SwiftUI
+            // ✅ DEVICE: Pre-warm ML models at app launch (saves ~5s on call start)
             #if !targetEnvironment(simulator)
+            Task {
+                await MainActor.run {
+                    audioManager.prepareAudioHardware()
+                }
+            }
+            
             callManager.$callState
                 .receive(on: RunLoop.main)
                 .sink { [self] (state: CallManager.CallState) in
@@ -151,19 +145,14 @@ struct ContentView: View {
                 }
                 .store(in: &cancellables)
 
-            // ✅ Device-only: Listen for CallKit lifecycle notifications using Combine
             NotificationCenter.default.publisher(for: NSNotification.Name("StartAudioInternal"))
                 .receive(on: RunLoop.main)
-                .sink { [self] _ in
-                    self.handleStartAudioInternal()
-                }
+                .sink { [self] _ in self.handleStartAudioInternal() }
                 .store(in: &cancellables)
 
             NotificationCenter.default.publisher(for: NSNotification.Name("EndAudioInternal"))
                 .receive(on: RunLoop.main)
-                .sink { [self] _ in
-                    self.handleEndAudioInternal()
-                }
+                .sink { [self] _ in self.handleEndAudioInternal() }
                 .store(in: &cancellables)
             #endif
         }
@@ -173,17 +162,16 @@ struct ContentView: View {
         }
     }
 
-    // ✅ Device: Called when CallKit fires didActivate
     private func handleStartAudioInternal() {
         #if !targetEnvironment(simulator)
-        logTime("🔔 handleStartAudioInternal received")
-        audioManager.setupAudioAfterActivation()
+        logTime("🔔 handleStartAudioInternal received", start: pipelineStartTime)
+        audioManager.setupAudioAfterActivation(pipelineStartTime: pipelineStartTime)
         #endif
     }
 
     private func handleEndAudioInternal() {
         #if !targetEnvironment(simulator)
-        logTime("🔔 handleEndAudioInternal received")
+        logTime("🔔 handleEndAudioInternal received", start: pipelineStartTime)
         stopThePipeline()
         #endif
     }
@@ -192,19 +180,14 @@ struct ContentView: View {
         let reachabilityStart = CFAbsoluteTimeGetCurrent()
         let hostname = AppConfig.resolvedServerHostname
         logTime("🔍 DEBUG: Using hostname = '\(hostname)'")
-
         await MainActor.run { serverReachable = nil }
-
         let url = URL(string: "http://\(hostname):5557/health")!
         var request = URLRequest(url: url)
         request.timeoutInterval = 8
-
         let config = URLSessionConfiguration.default
         config.allowsCellularAccess = false
         config.allowsConstrainedNetworkAccess = false
-
         let wifiSession = URLSession(configuration: config)
-
         do {
             let (_, response) = try await wifiSession.data(for: request)
             let httpResp = response as? HTTPURLResponse
@@ -220,7 +203,6 @@ struct ContentView: View {
     func enrollDevice() {
         let enrollStart = CFAbsoluteTimeGetCurrent()
         logTime("🔐 Starting enrollment...", start: enrollStart)
-
         isEnrolling = true
         enrollError = nil
         Task {
@@ -243,12 +225,11 @@ struct ContentView: View {
     }
 
     func startThePipeline() {
-        let pipelineStart = CFAbsoluteTimeGetCurrent()
-        logTime("📞 Starting call pipeline...", start: pipelineStart)
+        pipelineStartTime = CFAbsoluteTimeGetCurrent()
+        logTime("📞 [T+0ms] Start Call button tapped", start: pipelineStartTime)
         isCalling = true
 
         #if targetEnvironment(simulator)
-        // 🖥️ SIMULATOR: Direct path (unchanged)
         Task {
             do {
                 audioManager.securityManager = securityManager
@@ -260,22 +241,20 @@ struct ContentView: View {
                 logTime("🔐 Handshake complete", start: t2)
 
                 udpManager.connect(host: AppConfig.resolvedServerHostname, port: 5555)
-                logTime("🎉 Pipeline COMPLETE", start: pipelineStart)
+                logTime("🎉 Pipeline COMPLETE", start: pipelineStartTime)
             } catch {
-                logTime("❌ Pipeline FAILED: \(error)", start: pipelineStart)
+                logTime("❌ Pipeline FAILED: \(error)", start: pipelineStartTime)
                 stopThePipeline()
             }
         }
         #else
-        // 📱 DEVICE: CallKit path
         let capturedAudio = audioManager
         let capturedSecurity = securityManager
         let capturedUDP = udpManager
         let capturedCall = callManager
 
-        // ✅ Set callback BEFORE starting call
         audioManager.onEngineStarted = {
-            logTime("🔔 onEngineStarted FIRED — starting handshake")
+            logTime("🔔 onEngineStarted FIRED — starting handshake", start: self.pipelineStartTime)
             Task { @MainActor in
                 do {
                     let t2 = CFAbsoluteTimeGetCurrent()
@@ -285,11 +264,13 @@ struct ContentView: View {
                     capturedAudio.securityManager = capturedSecurity
                     capturedUDP.securityManager = capturedSecurity
                     capturedUDP.connect(host: AppConfig.resolvedServerHostname, port: 5555)
+                    
+                    logTime("📡 UDP connection ready", start: self.pipelineStartTime)
 
                     capturedCall.reportCallConnected()
-                    logTime("🎉 Pipeline COMPLETE", start: pipelineStart)
+                    logTime("🎉 Pipeline COMPLETE — Call Connected", start: self.pipelineStartTime)
                 } catch {
-                    logTime("❌ Post-activation setup FAILED: \(error)", start: pipelineStart)
+                    logTime("❌ Post-activation setup FAILED: \(error)", start: self.pipelineStartTime)
                     capturedAudio.endCall()
                     capturedUDP.disconnect()
                     capturedCall.endCall()
@@ -300,15 +281,15 @@ struct ContentView: View {
 
         Task {
             do {
-                // Phase 1: Slow DSP init BEFORE startCall
-                await MainActor.run { audioManager.prepareAudioHardware() }
+                // ✅ Phase 1 already done at app launch — skip here!
+                // await MainActor.run { audioManager.prepareAudioHardware() }
                 
-                // Phase 2: Start CallKit (will trigger didActivate → StartAudioInternal)
                 let t0 = CFAbsoluteTimeGetCurrent()
+                logTime("📞 CXTransaction requested", start: t0)
                 try await callManager.startCall(handle: "BunServer")
                 logTime("📞 callManager.startCall complete", start: t0)
             } catch {
-                logTime("❌ Pipeline FAILED: \(error)", start: pipelineStart)
+                logTime("❌ Pipeline FAILED: \(error)", start: pipelineStartTime)
                 audioManager.onEngineStarted = nil
                 await MainActor.run { self.stopThePipeline() }
             }
@@ -317,12 +298,7 @@ struct ContentView: View {
     }
 
     func stopThePipeline() {
-        logTime("🛑 Stopping pipeline...")
-        guard isCalling else {
-            logTime("⚠️ stopThePipeline called but isCalling is false — ignoring")
-            return
-        }
-        
+        logTime("🛑 Stopping pipeline...", start: pipelineStartTime)
         isCalling = false
         audioManager.endCall()
         udpManager.disconnect()
@@ -334,6 +310,6 @@ struct ContentView: View {
         #endif
         
         securityManager.clearSession()
-        logTime("✅ Pipeline stopped")
+        logTime("✅ Pipeline stopped", start: pipelineStartTime)
     }
 }

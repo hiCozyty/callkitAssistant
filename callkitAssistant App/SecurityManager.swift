@@ -41,21 +41,22 @@ class SecurityManager: ObservableObject {
     }
 
     func clearSession() {
-        // Notify server before clearing local state
         if let sessionId = currentSessionId {
+            logTime("🔐 Notifying server of disconnect (sessionId: \(sessionId))")
+            
             Task {
-                try? await disconnectFromServer(
-                    url: "http://\(AppConfig.serverHost):5556/auth/disconnect",
-                    sessionId: sessionId)
+                do {
+                    try await disconnectFromServer(
+                        url: "http://\(AppConfig.serverHost):5556/auth/disconnect",
+                        sessionId: sessionId
+                    )
+                    logTime("✅ Server disconnect notification SENT")
+                } catch {
+                    logTime("❌ Server disconnect notification FAILED: \(error)") 
+                }
             }
         }
-//        DispatchQueue.main.async {
-//            self.sessionKey = nil
-//            self.sequenceNumber = 0
-//            self.currentSessionId = nil
-//            logTime("🔐 Security: Session keys cleared.")
-//        }
-        // ✅ No need for DispatchQueue.main.async anymore
+        
         self.sessionKey = nil
         self.sequenceNumber = 0
         self.currentSessionId = nil

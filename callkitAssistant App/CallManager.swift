@@ -8,6 +8,8 @@ class CallManager: NSObject, CXProviderDelegate, ObservableObject {
     let controller = CXCallController()
     private let provider: CXProvider
     private let callKitQueue = DispatchQueue(label: "com.myApp.callkit")
+    private var pipelineStartTime: CFAbsoluteTime = 0
+
     
     var currentCallUUID: UUID? {
         didSet {
@@ -49,6 +51,9 @@ class CallManager: NSObject, CXProviderDelegate, ObservableObject {
     }
 
     func startCall(handle: String) async throws {
+        pipelineStartTime = CFAbsoluteTimeGetCurrent()
+        logTime("📞 [T+0ms] CallManager.startCall entered", start: pipelineStartTime)
+
         isCallIntentionallyEnded = false
         Task { @MainActor in self.callState = .starting }
         
@@ -118,7 +123,7 @@ class CallManager: NSObject, CXProviderDelegate, ObservableObject {
     }
     
     func provider(_ provider: CXProvider, didActivate audioSession: AVAudioSession) {
-        logTime("✅ CallKit: didActivate — posting StartAudioInternal")
+        logTime("✅ CallKit: didActivate — posting StartAudioInternal", start: pipelineStartTime)
         NotificationCenter.default.post(name: NSNotification.Name("StartAudioInternal"), object: nil)
     }
 
