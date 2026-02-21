@@ -24,7 +24,7 @@ struct ContentView: View {
     @StateObject private var audioManager = AudioStreamManager()
     @StateObject private var udpManager = UDPManager()
     @StateObject private var securityManager = SecurityManager()
-    // ❌ Removed callManager for Simulator-only focus
+    @StateObject private var callManager = CallManager()
 
     @State private var isCalling = false
     @State private var isEnrolled = false
@@ -32,6 +32,7 @@ struct ContentView: View {
     @State private var enrollError: String? = nil
     @State private var serverReachable: Bool? = nil
 
+    // ✅ Declare cancellables
     @State private var cancellables = Set<AnyCancellable>()
 
     #if targetEnvironment(simulator)
@@ -80,7 +81,6 @@ struct ContentView: View {
                             stopThePipeline()
                         }
                     } else {
-                        // Device placeholder
                         if !isCalling {
                             startThePipeline()
                         }
@@ -133,12 +133,59 @@ struct ContentView: View {
 
             Task { await checkServerReachability() }
             
-            // ❌ Removed callManager.$callState sink
+            // ✅ Device-only: Wire CallKit state to SwiftUI
+            #if !targetEnvironment(simulator)
+            callManager.$callState
+                .receive(on: RunLoop.main)
+                .sink { [self] (state: CallManager.CallState) in
+                    switch state {
+                    case .active:
+                        self.isCalling = true
+                    case .ended, .idle:
+                        if self.isCalling {
+                            self.isCalling = false
+                            self.stopThePipeline()
+                        }
+                    default: break
+                    }
+                }
+                .store(in: &cancellables)
+
+            // ✅ Device-only: Listen for CallKit lifecycle notifications using Combine
+            NotificationCenter.default.publisher(for: NSNotification.Name("StartAudioInternal"))
+                .receive(on: RunLoop.main)
+                .sink { [self] _ in
+                    self.handleStartAudioInternal()
+                }
+                .store(in: &cancellables)
+
+            NotificationCenter.default.publisher(for: NSNotification.Name("EndAudioInternal"))
+                .receive(on: RunLoop.main)
+                .sink { [self] _ in
+                    self.handleEndAudioInternal()
+                }
+                .store(in: &cancellables)
+            #endif
         }
         .onDisappear {
             cancellables.forEach { $0.cancel() }
             cancellables.removeAll()
         }
+    }
+
+    // ✅ Device: Called when CallKit fires didActivate
+    private func handleStartAudioInternal() {
+        #if !targetEnvironment(simulator)
+        logTime("🔔 handleStartAudioInternal received")
+        audioManager.setupAudioAfterActivation()
+        #endif
+    }
+
+    private func handleEndAudioInternal() {
+        #if !targetEnvironment(simulator)
+        logTime("🔔 handleEndAudioInternal received")
+        stopThePipeline()
+        #endif
     }
 
     func checkServerReachability() async {
@@ -201,23 +248,18 @@ struct ContentView: View {
         isCalling = true
 
         #if targetEnvironment(simulator)
+        // 🖥️ SIMULATOR: Direct path (unchanged)
         Task {
             do {
-                // ✅ 1. Wire Security Manager FIRST
                 audioManager.securityManager = securityManager
                 udpManager.securityManager = securityManager
-
-                // ✅ 2. Start Audio Engine (Tap will now see the manager)
                 audioManager.startAudio()
                 
-                // ✅ 3. Handshake (Audio buffers will drop until this completes, which is fine)
                 let t2 = CFAbsoluteTimeGetCurrent()
                 try await securityManager.performHandshake()
                 logTime("🔐 Handshake complete", start: t2)
 
-                // ✅ 4. Connect UDP
                 udpManager.connect(host: AppConfig.resolvedServerHostname, port: 5555)
-                
                 logTime("🎉 Pipeline COMPLETE", start: pipelineStart)
             } catch {
                 logTime("❌ Pipeline FAILED: \(error)", start: pipelineStart)
@@ -225,16 +267,72 @@ struct ContentView: View {
             }
         }
         #else
-        // Device Placeholder (CallKit logic to be implemented later)
-        logTime("⚠️ Device pipeline not yet implemented")
+        // 📱 DEVICE: CallKit path
+        let capturedAudio = audioManager
+        let capturedSecurity = securityManager
+        let capturedUDP = udpManager
+        let capturedCall = callManager
+
+        // ✅ Set callback BEFORE starting call
+        audioManager.onEngineStarted = {
+            logTime("🔔 onEngineStarted FIRED — starting handshake")
+            Task { @MainActor in
+                do {
+                    let t2 = CFAbsoluteTimeGetCurrent()
+                    try await capturedSecurity.performHandshake()
+                    logTime("🔐 Handshake complete", start: t2)
+
+                    capturedAudio.securityManager = capturedSecurity
+                    capturedUDP.securityManager = capturedSecurity
+                    capturedUDP.connect(host: AppConfig.resolvedServerHostname, port: 5555)
+
+                    capturedCall.reportCallConnected()
+                    logTime("🎉 Pipeline COMPLETE", start: pipelineStart)
+                } catch {
+                    logTime("❌ Post-activation setup FAILED: \(error)", start: pipelineStart)
+                    capturedAudio.endCall()
+                    capturedUDP.disconnect()
+                    capturedCall.endCall()
+                    capturedSecurity.clearSession()
+                }
+            }
+        }
+
+        Task {
+            do {
+                // Phase 1: Slow DSP init BEFORE startCall
+                await MainActor.run { audioManager.prepareAudioHardware() }
+                
+                // Phase 2: Start CallKit (will trigger didActivate → StartAudioInternal)
+                let t0 = CFAbsoluteTimeGetCurrent()
+                try await callManager.startCall(handle: "BunServer")
+                logTime("📞 callManager.startCall complete", start: t0)
+            } catch {
+                logTime("❌ Pipeline FAILED: \(error)", start: pipelineStart)
+                audioManager.onEngineStarted = nil
+                await MainActor.run { self.stopThePipeline() }
+            }
+        }
         #endif
     }
 
     func stopThePipeline() {
         logTime("🛑 Stopping pipeline...")
+        guard isCalling else {
+            logTime("⚠️ stopThePipeline called but isCalling is false — ignoring")
+            return
+        }
+        
         isCalling = false
         audioManager.endCall()
         udpManager.disconnect()
+        
+        #if !targetEnvironment(simulator)
+        if callManager.currentCallUUID != nil {
+            callManager.endCall()
+        }
+        #endif
+        
         securityManager.clearSession()
         logTime("✅ Pipeline stopped")
     }

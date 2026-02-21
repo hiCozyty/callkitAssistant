@@ -1,8 +1,9 @@
-//CallManager.swift
+// CallManager.swift
 import Foundation
 import CallKit
 import AVFoundation
 import Combine
+
 class CallManager: NSObject, CXProviderDelegate, ObservableObject {
     let controller = CXCallController()
     private let provider: CXProvider
@@ -15,19 +16,17 @@ class CallManager: NSObject, CXProviderDelegate, ObservableObject {
             }
         }
     }
+    
     func reportCallConnected() {
         guard let uuid = currentCallUUID else { return }
         provider.reportOutgoingCall(with: uuid, connectedAt: Date())
         logTime("📞 CallKit: reported call connected (session ready)")
     }
 
-    
     enum CallState { case idle, starting, active, ending, ended }
     @Published private(set) var callState: CallState = .idle
     
-    // ✅ Only allow didDeactivate to post EndAudioInternal when WE ended the call
     private var isCallIntentionallyEnded = false
-
     private var cancellables = Set<AnyCancellable>()
     
     override init() {
@@ -50,12 +49,8 @@ class CallManager: NSObject, CXProviderDelegate, ObservableObject {
     }
 
     func startCall(handle: String) async throws {
-        // ✅ Reset flag at the start of every new call
         isCallIntentionallyEnded = false
-
-        Task { @MainActor in
-            self.callState = .starting
-        }
+        Task { @MainActor in self.callState = .starting }
         
         let uuid = UUID()
         self.currentCallUUID = uuid
@@ -81,17 +76,15 @@ class CallManager: NSObject, CXProviderDelegate, ObservableObject {
     
     func providerDidReset(_ provider: CXProvider) {
         logTime("🔴 CallKit: providerDidReset fired")
-        stopAudio()
+        // ✅ stopAudio() removed — didDeactivate will handle teardown
         currentCallUUID = nil
     }
     
     func forceEndCall() {
         isCallIntentionallyEnded = true
-        Task { @MainActor in
-            self.callState = .ended
-        }
+        Task { @MainActor in self.callState = .ended }
         currentCallUUID = nil
-        stopAudio()
+        // ✅ stopAudio() removed — didDeactivate will handle teardown
     }
     
     func provider(_ provider: CXProvider, perform action: CXStartCallAction) {
@@ -105,11 +98,7 @@ class CallManager: NSObject, CXProviderDelegate, ObservableObject {
         }
         
         action.fulfill()
-//        provider.reportOutgoingCall(with: action.callUUID, connectedAt: Date())
-        
-        Task { @MainActor in
-            self.callState = .active
-        }
+        Task { @MainActor in self.callState = .active }
         logTime("CallKit: Call Started — waiting for session before reporting connected")
 
         #if targetEnvironment(simulator)
@@ -117,18 +106,14 @@ class CallManager: NSObject, CXProviderDelegate, ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
             self.provider(provider, didActivate: AVAudioSession.sharedInstance())
         }
-        #endif // targetEnvironment(simulator)
-
+        #endif
     }
 
     func provider(_ provider: CXProvider, perform action: CXEndCallAction) {
-        isCallIntentionallyEnded = true  // ✅ System-initiated end (e.g. CallKit UI)
-        stopAudio()
+        isCallIntentionallyEnded = true
+        // ✅ stopAudio() removed — didDeactivate will handle teardown
         action.fulfill()
-        
-        Task { @MainActor in
-            self.callState = .ended
-        }
+        Task { @MainActor in self.callState = .ended }
         logTime("CallKit: Call Ended")
     }
     
@@ -138,7 +123,6 @@ class CallManager: NSObject, CXProviderDelegate, ObservableObject {
     }
 
     func provider(_ provider: CXProvider, didDeactivate audioSession: AVAudioSession) {
-        // ✅ Log BEFORE the guard so we always see this fire
         logTime("⚠️ CallKit: didDeactivate — isCallIntentionallyEnded: \(isCallIntentionallyEnded)")
         guard isCallIntentionallyEnded else {
             logTime("⚠️ CallKit: Ignoring spurious didDeactivate")
@@ -148,14 +132,9 @@ class CallManager: NSObject, CXProviderDelegate, ObservableObject {
         NotificationCenter.default.post(name: NSNotification.Name("EndAudioInternal"), object: nil)
     }
 
-    private func stopAudio() {
-        logTime("📣 EndAudioInternal posted from: stopAudio() — callstack: \(Thread.callStackSymbols.prefix(5).joined(separator: "\n"))")
-        NotificationCenter.default.post(name: NSNotification.Name("EndAudioInternal"), object: nil)
-    }
-
     func endCall() {
         guard let uuid = currentCallUUID else { return }
-        isCallIntentionallyEnded = true  // ✅ User-initiated end
+        isCallIntentionallyEnded = true
         let endCallAction = CXEndCallAction(call: uuid)
         let transaction = CXTransaction(action: endCallAction)
         
