@@ -17,7 +17,7 @@ class SecurityManager: ObservableObject {
     private var sequenceNumber: UInt16 = 0
     private let keyTag = "com.myApp.voip.identity".data(using: .utf8)!
     private var currentSessionId: String?
-
+    private var nonceSalt = Data(repeating: 0, count: 10)
     private let certTag = "com.myApp.voip.clientcert".data(using: .utf8)!
 
     // Expose sessionId for UDP packets
@@ -363,8 +363,10 @@ class SecurityManager: ObservableObject {
     }
 
     func setSessionKey(_ keyData: Data) {
+        precondition(keyData.count == 16, "AES-128 requires 16-byte key, got \(keyData.count)")
         self.sessionKey = SymmetricKey(data: keyData)
         self.sequenceNumber = 0
+        self.nonceSalt = (0..<10).map { _ in UInt8.random(in: 0...255) }.withUnsafeBytes { Data($0) }
         logTime("🔐 Session key set")
     }
 
@@ -383,8 +385,10 @@ class SecurityManager: ObservableObject {
 
         // Create nonce with sequence number
         var nonceBytes = Data(count: 12)
+        nonceBytes.replaceSubrange(0..<10, with: nonceSalt)  // salt first
+
         withUnsafeBytes(of: sequenceNumber.bigEndian) {
-            nonceBytes.replaceSubrange(0..<2, with: $0)
+            nonceBytes.replaceSubrange(10..<12, with: $0)    // seq last 2 bytes
         }
         let nonce = try AES.GCM.Nonce(data: nonceBytes)
 

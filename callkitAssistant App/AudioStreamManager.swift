@@ -85,6 +85,7 @@ class AudioStreamManager: NSObject, ObservableObject {
             engine.connect(player, to: engine.mainMixerNode, format: hardwareFormat)
             inputNode.removeTap(onBus: 0)
             inputNode.installTap(onBus: 0, bufferSize: 960, format: hardwareFormat) { [weak self] (buffer, time) in
+
                 guard let self = self else { return }
                 self.analyzer?.analyze(buffer, atAudioFramePosition: time.sampleTime)
                 self.stateLock.lock()
@@ -223,6 +224,7 @@ class AudioStreamManager: NSObject, ObservableObject {
 
             inputNode.removeTap(onBus: 0)
             inputNode.installTap(onBus: 0, bufferSize: 960, format: hardwareFormat) { [weak self] (buffer, time) in
+
                 guard let self = self else { return }
                 self.analyzer?.analyze(buffer, atAudioFramePosition: time.sampleTime)
                 self.stateLock.lock()
@@ -342,20 +344,50 @@ class AudioStreamManager: NSObject, ObservableObject {
             logTime("🔴 processAndSend: sessionKey is nil — handshake incomplete?", start: pipelineStartTime)
             return
         }
-        
         networkQueue.async { [weak self] in
             guard let self = self else { return }
-            do {
-                var data = Data(count: 1500)
-                guard let encodedCount = try self.encoder?.encode(buffer, to: &data), encodedCount > 0 else {
-                    logTime("🔴 Encode returned 0 or nil", start: self.pipelineStartTime)
-                    return
+            
+            let samplesPerFrame: AVAudioFrameCount = 960
+            let totalFrameLength: AVAudioFrameCount = buffer.frameLength
+            var frameStart: AVAudioFrameCount = 0
+
+            while frameStart < totalFrameLength {
+                let remaining: AVAudioFrameCount = totalFrameLength - frameStart
+                let currentFrameLength: AVAudioFrameCount = min(remaining, samplesPerFrame)
+
+                guard let chunk = AVAudioPCMBuffer(pcmFormat: buffer.format, frameCapacity: samplesPerFrame) else {
+                    frameStart &+= currentFrameLength
+                    continue
                 }
-                let opusData = data.prefix(encodedCount)
-                let encryptedData = try secManager.encryptPayload(Data(opusData))
-                NotificationCenter.default.post(name: .sendUDP, object: encryptedData)
-            } catch {
-                logTime("🔴 processAndSend error: \(error)", start: self.pipelineStartTime)
+                chunk.frameLength = currentFrameLength
+
+                // Copy samples using floatChannelData (mono float32)
+                if let srcChannels = buffer.floatChannelData, let dstChannels = chunk.floatChannelData {
+                    // We assume mono (channel 0). If more channels are present, consider iterating channels.
+                    let src = srcChannels[0].advanced(by: Int(frameStart))
+                    let dst = dstChannels[0]
+                    let byteCount = Int(currentFrameLength) * MemoryLayout<Float>.size
+                    memcpy(dst, src, byteCount)
+                } else {
+                    // Fallback: if channel data is unavailable, skip this chunk safely
+                    frameStart &+= currentFrameLength
+                    continue
+                }
+
+                do {
+                    var data = Data(count: 1500)
+                    guard let encodedCount = try self.encoder?.encode(chunk, to: &data), encodedCount > 0 else {
+                        frameStart &+= currentFrameLength
+                        continue
+                    }
+                    let opusData = data.prefix(encodedCount)
+                    let encryptedData = try secManager.encryptPayload(Data(opusData))
+                    NotificationCenter.default.post(name: .sendUDP, object: encryptedData)
+                } catch {
+                    logTime("🔴 Chunk encode error: \(error)", start: self.pipelineStartTime)
+                }
+
+                frameStart &+= currentFrameLength
             }
         }
     }
@@ -392,3 +424,4 @@ class SpeechResultObserver: NSObject, SNResultsObserving {
         }
     }
 }
+

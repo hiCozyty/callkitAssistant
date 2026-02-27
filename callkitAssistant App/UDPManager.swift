@@ -20,6 +20,12 @@ class UDPManager: ObservableObject {
         // 1. Create custom UDP parameters
         let params = NWParameters.udp
 
+        params.serviceClass = .interactiveVoice
+        params.allowLocalEndpointReuse = true
+        // ✅ Force Wi-Fi preference
+        params.requiredInterfaceType = .wifi
+
+
         // 2. Set the Service Class to .interactiveVoice
         params.serviceClass = .interactiveVoice
 
