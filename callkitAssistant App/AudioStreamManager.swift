@@ -59,6 +59,7 @@ class AudioStreamManager: NSObject, ObservableObject {
 
             engine.attach(player)
             let inputNode = engine.inputNode
+//            try inputNode.setVoiceProcessingEnabled(true) //doesnt do anything..
             let hardwareFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48000, channels: 1, interleaved: false)!
             
             self.format = hardwareFormat
@@ -96,6 +97,17 @@ class AudioStreamManager: NSObject, ObservableObject {
 
             try engine.start()
             player.play()
+            
+            Task { @MainActor in
+                do {
+                    let session = AVAudioSession.sharedInstance()
+                    try session.setActive(true, options: [.notifyOthersOnDeactivation])
+                    logTime("🔊 Simulator: Audio session re-activated for playback")
+                } catch {
+                    logTime("⚠️ Failed to re-activate session: \(error)")
+                }
+            }
+            
             isActive = true
             hasEnded = false
             isTransmitting = true
@@ -282,10 +294,10 @@ class AudioStreamManager: NSObject, ObservableObject {
         observer.onSpeechStatusChanged = nil
         securityManager?.clearSession()
 
-        if let token = receivedObserver {
-            NotificationCenter.default.removeObserver(token)
-            receivedObserver = nil
-        }
+//        if let token = receivedObserver {
+//            NotificationCenter.default.removeObserver(token)
+//            receivedObserver = nil
+//        }
 
         try? AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])
         encoder = nil
@@ -295,12 +307,39 @@ class AudioStreamManager: NSObject, ObservableObject {
     }
 
     func handleIncomingAudio(data: Data) {
-        guard isActive, let decoder = self.decoder else { return }
+        guard isActive,
+              let secManager = self.securityManager,
+              let decoder = self.decoder
+        else {
+            logTime("🔴 handleIncomingAudio: guard failed - isActive=\(isActive), decoder=\(decoder != nil)")
+            return
+        }
+        
         do {
-            let decodedBuffer = try decoder.decode(data)
-            if !player.isPlaying { player.play() }
+//            logTime("📥 Incoming packet: \(data.count)B")
+            
+            // 1. Decrypt packet → raw Opus frame
+            let opusFrame = try secManager.decryptServerPayload(data)
+//            logTime("🔓 Decrypted Opus frame: \(opusFrame.count)B")
+            
+            // 2. Decode Opus → PCM buffer
+            let decodedBuffer = try decoder.decode(opusFrame)
+//            logTime("🎵 Decoded PCM: \(decodedBuffer.frameLength) frames @ \(decodedBuffer.format.sampleRate)Hz, channels=\(decodedBuffer.format.channelCount)")
+            
+            // 3. Check player state
+//            logTime("🔊 Player state: isPlaying=\(player.isPlaying), engine.isRunning=\(engine.isRunning)")
+            
+            // 4. Schedule for playback
+            if !player.isPlaying {
+//                logTime("▶️ Starting player")
+                player.play()
+            }
             player.scheduleBuffer(decodedBuffer, completionHandler: nil)
-        } catch { logTime("Decoding error: \(error)", start: pipelineStartTime) }
+//            logTime("✅ Buffer scheduled")
+            
+        } catch {
+            logTime("🔴 Incoming audio error: \(error)")
+        }
     }
 
     private func setupObservers() {
@@ -390,6 +429,15 @@ class AudioStreamManager: NSObject, ObservableObject {
                 frameStart &+= currentFrameLength
             }
         }
+    }
+    deinit {
+        // Only remove the NotificationCenter observer here
+        if let token = receivedObserver {
+            NotificationCenter.default.removeObserver(token)
+            receivedObserver = nil
+        }
+        // Optional safety cleanup (analyzer is already nil'd in endCall)
+        analyzer?.removeAllRequests()
     }
 }
 

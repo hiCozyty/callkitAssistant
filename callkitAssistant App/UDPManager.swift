@@ -10,35 +10,49 @@ class UDPManager: ObservableObject {
     private var sendObserver: NSObjectProtocol?
     private var heartbeatTimer: Timer?
     var securityManager: SecurityManager?
-
+    
     func connect(host: String, port: UInt16) {
         disconnect()
 
         let hostObj = NWEndpoint.Host(host)
         let portObj = NWEndpoint.Port(rawValue: port)!
 
-        // 1. Create custom UDP parameters
         let params = NWParameters.udp
-
         params.serviceClass = .interactiveVoice
         params.allowLocalEndpointReuse = true
-        // ✅ Force Wi-Fi preference
+        params.preferNoProxies = false
+
+        #if !targetEnvironment(simulator)
         params.requiredInterfaceType = .wifi
+        #endif
 
-
-        // 2. Set the Service Class to .interactiveVoice
-        params.serviceClass = .interactiveVoice
-
-        // 3. (Optional) Allow fast path to reduce overhead
-        params.preferNoProxies = false  // Must be false for the iPhone proxy to work!
-
-        // connection = NWConnection(host: hostObj, port: portObj, using: .udp)
+        // ✅ Create connection FIRST, then set all handlers
         connection = NWConnection(host: hostObj, port: portObj, using: params)
 
+        // ✅ pathUpdateHandler is now set on the actual connection object
+        connection?.pathUpdateHandler = { path in
+            logTime("🛜 Path status: \(path.status)")
+            logTime("🛜 Interfaces: \(path.availableInterfaces.map { "\($0.name)/\($0.type)" })")
+            logTime("🛜 Unsatisfied reason: \(String(describing: path.unsatisfiedReason))")
+        }
+
+        connection?.viabilityUpdateHandler = { isViable in
+            logTime("📶 Connection viable: \(isViable)")
+        }
+
         connection?.stateUpdateHandler = { [weak self] state in
-            print("UDP Connection State: \(state)")
-            if state == .ready {
+            logTime("UDP Connection State: \(state)")
+            switch state {
+            case .ready:
                 self?.startHeartbeat()
+            case .waiting(let error):
+                logTime("🟡 UDP waiting: \(error)")
+            case .failed(let error):
+                logTime("🔴 UDP failed: \(error)")
+            case .cancelled:
+                logTime("⚪ UDP cancelled")
+            default:
+                break
             }
         }
 
@@ -56,6 +70,7 @@ class UDPManager: ObservableObject {
         receiveLoop()
     }
 
+
     private func startHeartbeat() {
         stopHeartbeat()
         DispatchQueue.main.async {
@@ -70,7 +85,7 @@ class UDPManager: ObservableObject {
                 heartbeatPacket.append(0x00)
 
                 self.send(data: heartbeatPacket)
-                print("UDP: Heartbeat sent for \(idData.count) bytes")
+//                logTime("UDP: Heartbeat sent for \(idData.count) bytes")
             }
         }
     }
@@ -93,29 +108,65 @@ class UDPManager: ObservableObject {
 
         connection?.cancel()
         connection = nil
-        print("UDP: Connection and observers cleared")
+        logTime("UDP: Connection and observers cleared")
     }
 
     func send(data: Data) {
-        connection?.send(
+        guard let connection = connection else {
+            logTime("🔴 UDP send failed: no connection")
+            return
+        }
+        guard connection.state == .ready else {
+            logTime("🟡 UDP send skipped: state is \(connection.state), not ready")
+            return
+        }
+        connection.send(
             content: data,
             completion: .contentProcessed({ error in
-                if let error = error { print("UDP Send error: \(error)") }
+                if let error = error { logTime("UDP Send error: \(error)") }
             }))
     }
 
     private func receiveLoop() {
         connection?.receiveMessage { [weak self] (data, context, isComplete, error) in
             guard let self = self else { return }
-            if let data = data {
-                NotificationCenter.default.post(name: .receivedUDP, object: data)
+            
+            // ✅ LOG EVERY CALLBACK INVOCATION
+            if let error = error {
+                logTime("🔴 UDP receiveMessage error: \(error) (domain: \(error._domain), code: \(error._code))")
+            } else {
+//                logTime("📡← UDP received \(data?.count ?? 0)B")
             }
-            if error == nil && self.connection != nil {
+            
+            if let data = data {
+                DispatchQueue.main.async {
+                    NotificationCenter.default.post(name: .receivedUDP, object: data)
+                }
+            }
+            
+            let state = self.connection?.state
+            let shouldContinue: Bool
+            
+            switch state {
+            case .ready, .preparing, .setup:
+                shouldContinue = true
+            case .waiting(let nwError), .failed(let nwError):
+                // Log the error and stop recursing
+                logTime("⚠️ UDP connection unhealthy: \(nwError)")
+                shouldContinue = false
+            case .cancelled, .none:
+                shouldContinue = false
+            @unknown default:
+                shouldContinue = false
+            }
+            
+            if shouldContinue {
                 self.receiveLoop()
+            } else {
+                logTime("⚠️ UDP receiveLoop stopped - state: \(state ?? .cancelled)")
             }
         }
     }
-
     // ADDED: Cleanup on deinit
     deinit {
         disconnect()

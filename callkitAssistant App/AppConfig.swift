@@ -7,7 +7,7 @@ enum AppConfig {
 
     #if DEBUG
     static var resolvedServerHostname: String {
-        return "192.168.1.160" // Hardcode your server IP for development
+        return "192.168.1.132" // Hardcode your server IP for development
     }
     #else
     static var resolvedServerHostname: String {
