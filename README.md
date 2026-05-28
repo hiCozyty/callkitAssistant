@@ -20,7 +20,7 @@ A watchOS VoIP calling app with end-to-end encrypted audio streaming. Built with
 
 - Xcode 16.2+
 - watchOS 26.0
-- A compatible Bun server (see [server repo](#))
+- A compatible Bun server 
 
 ---
 
